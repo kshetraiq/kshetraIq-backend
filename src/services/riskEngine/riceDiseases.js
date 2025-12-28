@@ -3,52 +3,36 @@
 
 const { clamp01, aggregateWeather } = require("./common");
 
-/**
- * Seasonal multiplier for blast based on date
- * (derived from TN/Coimbatore seasonal pattern and adapted).
- */
+/** Seasonal multiplier for blast (rough) */
 function seasonalBlastMultiplier(date) {
   const m = date.getUTCMonth() + 1;
   const d = date.getUTCDate();
   const md = m * 100 + d;
 
-  // mid-Nov → Jan end: severe blast season
   if (md >= 1115 || md <= 131) return 1.4;
-
-  // Sep → mid-Nov, early Feb: high risk windows
   if ((md >= 901 && md <= 1114) || (md >= 201 && md <= 215)) return 1.2;
-
-  // mid-Apr → mid-Jun: very low blast period (hot & dry)
   if (md >= 415 && md <= 615) return 0.6;
-
-  // default
   return 1.0;
 }
 
-/**
- * Stage multiplier – disease-specific sensitivity to crop stage
- */
+/** Crop stage sensitivity */
 function stageMultiplier(stage, disease) {
   switch (disease) {
     case "PADDY_BLAST":
-      // blast: nursery → heading, peak from tillering to heading
       if (["tillering", "panicle-init", "booting", "heading"].includes(stage)) return 1.2;
       if (stage === "maturity") return 0.7;
       return 1.0;
 
     case "PADDY_BLB":
-      // BLB: tillering to booting/heading
       if (["tillering", "panicle-init", "booting", "heading"].includes(stage)) return 1.2;
       return 0.9;
 
     case "PADDY_SHEATH_BLIGHT":
-      // sheath blight: dense canopy & later stages
       if (["panicle-init", "booting", "heading"].includes(stage)) return 1.3;
       if (stage === "tillering") return 1.0;
       return 0.8;
 
     case "PADDY_BROWN_SPOT":
-      // brown spot: all stages, but stress later matters more
       if (["tillering", "panicle-init", "booting"].includes(stage)) return 1.1;
       return 1.0;
 
@@ -58,97 +42,100 @@ function stageMultiplier(stage, disease) {
 }
 
 /**
- * Rice blast scoring from aggregated weather.
- * WeatherAgg: output of aggregateWeather(window).
+ * BLAST – now uses (if available): vpd7, dew7, fogDays
  */
-function scoreBlast(weatherAgg) {
-  const { tMin7, rhM7, rhE7, sr7, rain7, lw7, evp7 } = weatherAgg;
+function scoreBlast(agg) {
+  const { tMin7, rhM7, rhE7, sr7, rain7, lw7, evp7, vpd7, dew7, fogDays } = agg;
 
-  // cooler nights → higher risk (18–25°C window)
-  const tMinRisk = clamp01((25 - tMin7) / 7);      // 1 if ~18°C, ~0 if ≥25–26°C
+  const tMinRisk = clamp01((25 - tMin7) / 7);             // ~18°C => high
+  const rhMScore = clamp01((rhM7 - 75) / 20);             // 75–95
+  const rhEScore = clamp01((rhE7 - 60) / 25);             // 60–85
 
-  // high humidity (morning/evening)
-  const rhMScore = clamp01((rhM7 - 75) / 20);      // 75–95%
-  const rhEScore = clamp01((rhE7 - 60) / 25);      // 60–85%
+  // Open-Meteo shortwave_radiation_sum ~ MJ/m²/day (typical ~10–25)
+  const srScore = clamp01((18 - sr7) / 6);                // cloudy => higher risk
+  const lwScore = clamp01(lw7 / 10);                      // 0–10 hours/day
+  const rainScore = clamp01(rain7 / 80);                  // up to 80 mm/week
+  const evpScore = clamp01((5 - evp7) / 3);               // low evap => more humid
 
-// Use Open-Meteo MJ m⁻² day⁻¹ scale (≈10–25 MJ typical)
-const srScore = clamp01((18 - sr7) / 6); // ≤12 → 1 (cloudy), ≥24 → 0 (sunny)
+  // NEW: low VPD => humid; fog days => persistent wetness; dew point higher => condensation likely
+  const vpdScore = (typeof vpd7 === "number" && Number.isFinite(vpd7))
+    ? clamp01((1.2 - vpd7) / 0.8)                          // <=0.4 → 1, >=1.2 → 0
+    : 0;
 
-  // more leaf wetness = higher risk
-  const lwScore  = clamp01(lw7 / 10);              // 0–10 h/day
+  const fogScore = (typeof fogDays === "number" && Number.isFinite(fogDays))
+    ? clamp01(fogDays / 3)                                 // 0–3 days
+    : 0;
 
-  // recent rain supports infection but saturates
-  const rainScore = clamp01(rain7 / 80);           // up to ~80 mm/week
+  const dewScore = (typeof dew7 === "number" && Number.isFinite(dew7))
+    ? clamp01((dew7 - 18) / 6)                              // 18–24°C dewpoint
+    : 0;
 
-  // low evaporation → more humid
-  
-  const evpScore  = clamp01((5 - evp7) / 3);       // 2–5 mm/day typical
+  const contributions = {
+    srScore: 1.6 * srScore,
+    tMinRisk: 1.2 * tMinRisk,
+    rhMScore: 1.0 * rhMScore,
+    rhEScore: 0.6 * rhEScore,
+    lwScore: 0.7 * lwScore,
+    evpScore: 0.4 * evpScore,
+    rainScore: 0.3 * rainScore,
+    vpdScore: 0.6 * vpdScore,
+    fogScore: 0.4 * fogScore,
+    dewScore: 0.3 * dewScore,
+  };
 
-  // weights reflect regression + sensitivity (SR highest)
-  const raw =
-    1.6 * srScore +
-    1.2 * tMinRisk +
-    1.0 * rhMScore +
-    0.6 * rhEScore +
-    0.7 * lwScore +
-    0.4 * evpScore +
-    0.3 * rainScore;
-
-  // squash to 0–1
+  const raw = Object.values(contributions).reduce((a, b) => a + b, 0);
   const risk01 = 1 / (1 + Math.exp(-(raw - 2.5)));
 
-  return {
-    risk01,
-    drivers: { tMinRisk, rhMScore, rhEScore, srScore, lwScore, rainScore, evpScore },
-  };
+  return { risk01, drivers: { tMinRisk, rhMScore, rhEScore, srScore, lwScore, rainScore, evpScore, vpdScore, fogScore, dewScore }, contributions };
 }
 
-/**
- * BLB scoring – warm, humid, with rain and wind splash, high N.
- */
-function scoreBLB(weatherAgg, management) {
-  const { tMean7, rhM7, rhE7, rain7, rainyDays, wind7, evp7 } = weatherAgg;
+function scoreBLB(agg, management) {
+  const { tMean7, rhM7, rhE7, rain7, rainyDays, wind7, evp7, vpd7 } = agg;
 
-  const tempScore = clamp01((tMean7 - 22) / 10);         // 22–32°C
-  const rhScore   = clamp01((Math.max(rhM7, rhE7) - 75) / 20); // RH 75–95%
-  const rainFreq  = clamp01(rainyDays / 5);              // 0–5 rainy days
-  const rainAmt   = clamp01(rain7 / 100);                // up to 100 mm/week
-  const windScore = clamp01(wind7 / 3);                  // up to ~3 m/s
-  const lowEvp    = clamp01((5 - evp7) / 3);             // low evap = humid
+  const tempScore = clamp01((tMean7 - 22) / 10); // 22–32
+  const rhScore = clamp01((Math.max(rhM7, rhE7) - 75) / 20);
+  const rainFreq = clamp01(rainyDays / 5);
+  const rainAmt = clamp01(rain7 / 100);
+  const windScore = clamp01(wind7 / 3);
+  const lowEvp = clamp01((5 - evp7) / 3);
+
+  const vpdScore = (typeof vpd7 === "number" && Number.isFinite(vpd7))
+    ? clamp01((1.3 - vpd7) / 0.9)
+    : 0;
 
   const highN =
     management?.nitrogenLevel === "HIGH" ? 1 :
     management?.nitrogenLevel === "MEDIUM" ? 0.5 : 0;
 
-  const raw =
-    1.1 * tempScore +
-    1.1 * rhScore +
-    0.7 * rainFreq +
-    0.4 * rainAmt +
-    0.4 * windScore +
-    0.4 * lowEvp +
-    0.5 * highN;
+  const contributions = {
+    tempScore: 1.1 * tempScore,
+    rhScore: 1.1 * rhScore,
+    rainFreq: 0.7 * rainFreq,
+    rainAmt: 0.4 * rainAmt,
+    windScore: 0.4 * windScore,
+    lowEvp: 0.4 * lowEvp,
+    highN: 0.5 * highN,
+    vpdScore: 0.3 * vpdScore,
+  };
 
+  const raw = Object.values(contributions).reduce((a, b) => a + b, 0);
   const risk01 = 1 / (1 + Math.exp(-(raw - 2.3)));
 
-  return {
-    risk01,
-    drivers: { tempScore, rhScore, rainFreq, rainAmt, windScore, lowEvp, highN },
-  };
+  return { risk01, drivers: { tempScore, rhScore, rainFreq, rainAmt, windScore, lowEvp, highN, vpdScore }, contributions };
 }
 
-/**
- * Sheath blight – very humid, warm, long leaf wetness,
- * dense canopy, high N, continuous flooding.
- */
-function scoreSheathBlight(weatherAgg, management) {
-  const { tMean7, rhM7, rhE7, lw7, rain7, rainyDays } = weatherAgg;
+function scoreSheathBlight(agg, management) {
+  const { tMean7, rhM7, rhE7, lw7, rain7, rainyDays, vpd7 } = agg;
 
-  const tempScore = clamp01((tMean7 - 24) / 8);           // 24–32°C
-  const rhScore   = clamp01((Math.max(rhM7, rhE7) - 80) / 15); // 80–95%
-  const lwScore   = clamp01(lw7 / 10);                    // 0–10 h/day
-  const rainFreq  = clamp01(rainyDays / 5);
-  const rainAmt   = clamp01(rain7 / 80);
+  const tempScore = clamp01((tMean7 - 24) / 8);
+  const rhScore = clamp01((Math.max(rhM7, rhE7) - 80) / 15);
+  const lwScore = clamp01(lw7 / 10);
+  const rainFreq = clamp01(rainyDays / 5);
+  const rainAmt = clamp01(rain7 / 80);
+
+  const vpdScore = (typeof vpd7 === "number" && Number.isFinite(vpd7))
+    ? clamp01((1.1 - vpd7) / 0.8)
+    : 0;
 
   const highN =
     management?.nitrogenLevel === "HIGH" ? 1 :
@@ -158,33 +145,32 @@ function scoreSheathBlight(weatherAgg, management) {
     management?.waterStatus === "FLOODED" ? 1 :
     management?.waterStatus === "NORMAL" ? 0.5 : 0;
 
-  const raw =
-    1.1 * tempScore +
-    1.2 * rhScore +
-    1.0 * lwScore +
-    0.4 * rainFreq +
-    0.3 * rainAmt +
-    0.6 * highN +
-    0.5 * flooded;
+  const contributions = {
+    tempScore: 1.1 * tempScore,
+    rhScore: 1.2 * rhScore,
+    lwScore: 1.0 * lwScore,
+    rainFreq: 0.4 * rainFreq,
+    rainAmt: 0.3 * rainAmt,
+    highN: 0.6 * highN,
+    flooded: 0.5 * flooded,
+    vpdScore: 0.3 * vpdScore,
+  };
 
+  const raw = Object.values(contributions).reduce((a, b) => a + b, 0);
   const risk01 = 1 / (1 + Math.exp(-(raw - 2.4)));
 
-  return {
-    risk01,
-    drivers: { tempScore, rhScore, lwScore, rainFreq, rainAmt, highN, flooded },
-  };
+  return { risk01, drivers: { tempScore, rhScore, lwScore, rainFreq, rainAmt, highN, flooded, vpdScore }, contributions };
 }
 
-/**
- * Brown spot – associated with stress: low fertility, water stress, low rain.
- */
-function scoreBrownSpot(weatherAgg, management) {
-  const { tMean7, rhM7, rain7 } = weatherAgg;
+function scoreBrownSpot(agg, management) {
+  const { tMean7, rhM7, rain7, evp7 } = agg;
 
-  const tempScore = clamp01((tMean7 - 20) / 10);       // 20–30°C
-  const rhScore   = clamp01((rhM7 - 60) / 20);         // 60–80% moderate humidity
+  const tempScore = clamp01((tMean7 - 20) / 10);
+  const rhScore = clamp01((rhM7 - 60) / 20);
 
-  const lowRain   = clamp01((40 - rain7) / 40);        // less rain → more stress
+  // stress: low rain + higher evap
+  const lowRain = clamp01((40 - rain7) / 40);
+  const highEvp = clamp01((evp7 - 5) / 3);
 
   const stressWater =
     management?.waterStatus === "STRESSED" ? 1 :
@@ -194,26 +180,23 @@ function scoreBrownSpot(weatherAgg, management) {
     management?.nitrogenLevel === "LOW" ? 1 :
     management?.nitrogenLevel === "MEDIUM" ? 0.5 : 0;
 
-  const raw =
-    0.8 * tempScore +
-    0.6 * rhScore +
-    0.8 * lowRain +
-    0.7 * stressWater +
-    0.6 * lowN;
+  const contributions = {
+    tempScore: 0.8 * tempScore,
+    rhScore: 0.6 * rhScore,
+    lowRain: 0.8 * lowRain,
+    highEvp: 0.4 * highEvp,
+    stressWater: 0.7 * stressWater,
+    lowN: 0.6 * lowN,
+  };
 
+  const raw = Object.values(contributions).reduce((a, b) => a + b, 0);
   const risk01 = 1 / (1 + Math.exp(-(raw - 2.0)));
 
-  return {
-    risk01,
-    drivers: { tempScore, rhScore, lowRain, stressWater, lowN },
-  };
+  return { risk01, drivers: { tempScore, rhScore, lowRain, highEvp, stressWater, lowN }, contributions };
 }
 
-/**
- * Convert 0–1 risk to score 0–100 + level
- */
 function classifyRisk(risk01) {
-  const score = Math.round(risk01 * 100);
+  const score = Math.round(clamp01(risk01) * 100);
   let level = "GREEN";
   if (score >= 75) level = "RED";
   else if (score >= 50) level = "ORANGE";
@@ -221,21 +204,43 @@ function classifyRisk(risk01) {
   return { score, level };
 }
 
-/**
- * Main entry: evaluateRiceDiseaseRiskV2
- *
- * @param {string} disease  - "PADDY_BLAST" | "PADDY_BLB" | "PADDY_SHEATH_BLIGHT" | "PADDY_BROWN_SPOT"
- * @param {object} window   - weather window object built in riskService (7-day arrays + cropStage + management)
- * @returns { score, level, explanation, drivers }
- */
+function topDriverText(contributions, max = 3) {
+  if (!contributions) return "";
+  const sorted = Object.entries(contributions)
+    .sort((a, b) => (b[1] || 0) - (a[1] || 0))
+    .slice(0, max)
+    .map(([k]) => {
+      const map = {
+        srScore: "low solar radiation (cloudy)",
+        tMinRisk: "favourable cool nights",
+        rhMScore: "high morning humidity",
+        rhEScore: "high evening humidity",
+        lwScore: "long leaf wetness",
+        rainScore: "recent rainfall",
+        rainFreq: "frequent rainy days",
+        rainAmt: "high weekly rainfall",
+        windScore: "wind-driven splash",
+        lowEvp: "low evaporation (humid)",
+        vpdScore: "low VPD (humid air)",
+        fogScore: "foggy days",
+        dewScore: "high dew point",
+        tempScore: "warm temperature window",
+        rhScore: "high humidity",
+        highN: "high nitrogen level",
+        flooded: "continuous flooding",
+        lowRain: "low rainfall stress",
+        highEvp: "high evap stress",
+        stressWater: "reported water stress",
+        lowN: "low nitrogen stress",
+      };
+      return map[k] || k;
+    });
+  return sorted.join("; ");
+}
+
 function evaluateRiceDiseaseRiskV2(disease, window) {
-  if (!window || !window.dates || window.dates.length === 0) {
-    return {
-      score: 0,
-      level: "GREEN",
-      explanation: "No recent weather data",
-      drivers: {},
-    };
+  if (!window || !Array.isArray(window.dates) || window.dates.length === 0) {
+    return { score: 0, level: "GREEN", explanation: "No recent weather data", drivers: {}, meta: window?.meta || null };
   }
 
   const agg = aggregateWeather(window);
@@ -243,87 +248,49 @@ function evaluateRiceDiseaseRiskV2(disease, window) {
 
   let risk01 = 0;
   let drivers = {};
+  let contributions = {};
 
   if (disease === "PADDY_BLAST") {
     const r = scoreBlast(agg);
-    risk01 = r.risk01;
+    risk01 = r.risk01 * seasonalBlastMultiplier(now);
     drivers = r.drivers;
-    // apply blast seasonality
-    risk01 *= seasonalBlastMultiplier(now);
+    contributions = r.contributions;
   } else if (disease === "PADDY_BLB") {
     const r = scoreBLB(agg, window.management);
     risk01 = r.risk01;
     drivers = r.drivers;
+    contributions = r.contributions;
   } else if (disease === "PADDY_SHEATH_BLIGHT") {
     const r = scoreSheathBlight(agg, window.management);
     risk01 = r.risk01;
     drivers = r.drivers;
+    contributions = r.contributions;
   } else if (disease === "PADDY_BROWN_SPOT") {
     const r = scoreBrownSpot(agg, window.management);
     risk01 = r.risk01;
     drivers = r.drivers;
+    contributions = r.contributions;
   } else {
-    // unknown disease → no risk
-    return {
-      score: 0,
-      level: "GREEN",
-      explanation: "Disease not supported in risk engine",
-      drivers: {},
-    };
+    return { score: 0, level: "GREEN", explanation: "Disease not supported", drivers: {}, meta: window.meta || null };
   }
 
   // stage adjustment
   risk01 *= stageMultiplier(window.cropStage, disease);
-  // clamp to 0–1
-  risk01 = Math.max(0, Math.min(1, risk01));
+  risk01 = clamp01(risk01);
 
   const { score, level } = classifyRisk(risk01);
 
-  // Build human explanation from main positive drivers
-  const explanationParts = [];
-
-  // These checks are generic – only push if that driver exists and is high.
-  if (drivers.tMinRisk !== undefined && drivers.tMinRisk > 0.5) {
-    explanationParts.push("favourable night temperature");
-  }
-  if (drivers.rhMScore !== undefined && drivers.rhMScore > 0.5) {
-    explanationParts.push("high morning humidity");
-  }
-  if (drivers.rhScore !== undefined && drivers.rhScore > 0.5) {
-    explanationParts.push("high humidity");
-  }
-  if (drivers.srScore !== undefined && drivers.srScore > 0.5) {
-    explanationParts.push("low solar radiation (cloudy conditions)");
-  }
-  if (drivers.lwScore !== undefined && drivers.lwScore > 0.5) {
-    explanationParts.push("long leaf wetness duration");
-  }
-  if (drivers.rainFreq !== undefined && drivers.rainFreq > 0.5) {
-    explanationParts.push("frequent rainfall events");
-  }
-  if (drivers.lowRain !== undefined && drivers.lowRain > 0.5) {
-    explanationParts.push("low rainfall and possible water stress");
-  }
-  if (drivers.highN !== undefined && drivers.highN > 0.5) {
-    explanationParts.push("high nitrogen level");
-  }
-  if (drivers.stressWater !== undefined && drivers.stressWater > 0.5) {
-    explanationParts.push("reported water stress in field");
-  }
-  if (drivers.flooded !== undefined && drivers.flooded > 0.5) {
-    explanationParts.push("continuous flooding and dense canopy");
-  }
-
-  const explanation =
-    explanationParts.length > 0
-      ? explanationParts.join("; ")
-      : "Weather and crop conditions are not strongly favourable";
+  const keyDrivers = topDriverText(contributions, 3);
+  const explanation = keyDrivers
+    ? `Main drivers: ${keyDrivers}`
+    : "Weather and crop conditions are not strongly favourable";
 
   return {
-    score,       // 0–100
-    level,       // "GREEN" | "YELLOW" | "ORANGE" | "RED"
+    score,
+    level,
     explanation,
     drivers,
+    meta: window.meta || null,
   };
 }
 

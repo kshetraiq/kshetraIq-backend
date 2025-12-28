@@ -1,10 +1,25 @@
 const mongoose = require("mongoose");
 
 const DISEASE_TYPES = [
+  // Rice
   "PADDY_BLAST",
   "PADDY_BLB",
   "PADDY_SHEATH_BLIGHT",
   "PADDY_BROWN_SPOT",
+
+  // Chilli
+  "CHILLI_ANTHRACNOSE",
+  "CHILLI_POWDERY_MILDEW",
+  "CHILLI_THRIPS",
+
+  // Black Gram
+  "BLACKGRAM_POWDERY_MILDEW",
+  "BLACKGRAM_LEAF_SPOT",
+  "BLACKGRAM_YMV",
+
+  // Maize
+  "MAIZE_FAW",
+  "MAIZE_LEAF_BLIGHT",
 ];
 
 const DiseaseObservationSchema = new mongoose.Schema(

@@ -6,10 +6,11 @@ const { WeatherForecastNowcast } = require("./models/weatherForecastNowcast");
 const { WeatherForecast } = require("./models/weatherForecast");
 const { WeatherDaily } = require("./models/weatherDaily");
 const { ingestWeatherForPlotFromOpenMeteo, syncDailyArchive } = require("./services/weatherIngestSerivice");
-
 async function runVerification() {
     console.log("Starting Verification...");
     await connectDB();
+
+
 
     // 1. Find or Create Plot
     let plot = await Plot.findOne();

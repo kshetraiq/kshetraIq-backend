@@ -12,7 +12,11 @@ const PlotSchema = new mongoose.Schema(
       lng: { type: Number, required: true },
     },
     areaAcre: { type: Number },
-    crop: { type: String, enum: ["RICE"], default: "RICE" },
+    crop: {
+      type: String,
+      enum: ["RICE", "CHILLI", "BLACKGRAM", "MAIZE"],
+      default: "RICE"
+    },
     variety: { type: String, required: true },
     sowingDate: { type: Date, required: true },
     irrigationType: { type: String },  // canal / bore / tank
