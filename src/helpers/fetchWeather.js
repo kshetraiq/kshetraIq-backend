@@ -147,13 +147,24 @@ async function fetchWeatherForLatLon(lat, lon, extraParams = {}) {
   });
 
   console.log("Fetching weather for lat/lon:", lat, lon);
-  console.log("Params:", params);
+
 
   const hasRange = !!params.start_date || !!params.end_date;
   const url = hasRange ? ARCHIVE_URL : FORECAST_URL;
 
-  const res = await axios.get(url, { params });
-  return res.data;
+
+  try {    const res = await axios.get(url, { params });
+    return res.data;
+  } catch (error) {
+    console.error("Error fetching weather data:", error.response?.data || error.message);
+    throw new Error("Failed to fetch weather data");
+  }
+
+
+
+  
+
+
 }
 
 module.exports = {

@@ -79,6 +79,9 @@ const RiskEventSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.Mixed,
     },
 
+    naturalRemedies: [{ type: String }],
+    chemicalRemedies: [{ type: String }],
+
     createdBy: {
       type: String,
       enum: ["RULE_ENGINE", "MODEL", "MANUAL"],

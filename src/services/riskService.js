@@ -337,6 +337,16 @@ async function evaluateRiskForPlot(
     return { plot, mode, risks: [], message: `No supported diseases for crop: ${plot.crop}` };
   }
 
+  // Pre-fetch remedies for this crop
+  const { Remedy } = require("../models/remedy");
+  const remedies = await Remedy.find({ crop: plot.crop }).lean();
+  const remedyMap = new Map();
+  for (const r of remedies) {
+    remedyMap.set(r.disease, r);
+  }
+
+  console.log(`Evaluating ${mode} risks for plot ${plot._id} (${plot.name}) for diseases:`, relevantDiseases);
+
   // PROACTIVE = combine PAST + FORECAST
   if (mode === "PROACTIVE") {
     let pastWindow = await buildWeatherWindowForPlot({ plot, daysWindow, windowType: "PAST" });
@@ -372,6 +382,8 @@ async function evaluateRiskForPlot(
         weights: { pastWeight, futureWeight },
       };
 
+      const remedy = remedyMap.get(disease);
+      console.log(`PROACTIVE risk for ${disease} on plot ${plot._id}: score=${combinedScore}, level=${combinedLevel}`);
       const riskEvent = await RiskEvent.findOneAndUpdate(
         { plot: plot._id, disease, date: today, source: "WEATHER_V2_PROACTIVE" },
         {
@@ -383,6 +395,8 @@ async function evaluateRiskForPlot(
           horizonDays: daysWindow,
           explanation,
           drivers,
+          naturalRemedies: remedy?.naturalRemedies || [],
+          chemicalRemedies: remedy?.chemicalRemedies || [],
           source: "WEATHER_V2_PROACTIVE",
           createdBy: "RULE_ENGINE",
         },
@@ -395,14 +409,18 @@ async function evaluateRiskForPlot(
     return { plot, mode, risks: riskEvents };
   }
 
+
+
   // single-window modes
   const windowType = mode === "PAST" ? "PAST" : "FORECAST";
 
   let window = await buildWeatherWindowForPlot({ plot, daysWindow, windowType });
-
+  console.log("Built weather window for plot:", plot._id, "windowType:", windowType, "window days:", window?.dates?.length);
   const needsIngestForecast =
     windowType === "FORECAST" &&
     (!window || !Array.isArray(window.dates) || window.dates.length < daysWindow);
+  console.log("Evaluating the weather through the window and needsIngestForecast: and daysWindows", needsIngestForecast, daysWindow);
+
 
   if (needsIngestForecast && autoIngestIfMissing) {
     await ingestWeatherForPlotFromOpenMeteo(plot._id.toString(), daysWindow);
@@ -414,9 +432,9 @@ async function evaluateRiskForPlot(
   }
 
   const source = mode === "PAST" ? "WEATHER_V2_PAST" : "WEATHER_V2_FORECAST";
-
   for (const disease of relevantDiseases) {
     const r = evaluateDisease(disease, window);
+    const remedy = remedyMap.get(disease);
 
     const riskEvent = await RiskEvent.findOneAndUpdate(
       { plot: plot._id, disease, date: today, source },
@@ -429,12 +447,14 @@ async function evaluateRiskForPlot(
         horizonDays: daysWindow,
         explanation: r.explanation,
         drivers: r, // store full detail: score/level/explanation/drivers/meta
+        naturalRemedies: remedy?.naturalRemedies || [],
+        chemicalRemedies: remedy?.chemicalRemedies || [],
         source,
         createdBy: "RULE_ENGINE",
       },
       { upsert: true, new: true, setDefaultsOnInsert: true }
     );
-
+    console.log(`${mode} risk for ${disease} on plot ${plot._id}: score=${r.score}, level=${r.level}`);
     riskEvents.push(riskEvent);
   }
 
@@ -448,40 +468,59 @@ async function evaluateRiskForAllPlots({
   pastWeight = 0.4,
   futureWeight = 0.6,
 } = {}) {
+  const BATCH_SIZE = 50; // Process 50 plots at a time
   const plots = await Plot.find({});
+  const totalPlots = plots.length;
   const results = [];
 
-  for (const plot of plots) {
-    try {
-      const res = await evaluateRiskForPlot(plot._id, {
-        daysWindow,
-        mode,
-        autoIngestIfMissing,
-        pastWeight,
-        futureWeight,
-      });
+  console.log(`🚀 Starting Risk Eval for ${totalPlots} plots. Batch Size: ${BATCH_SIZE}`);
 
-      results.push({
-        plotId: plot._id,
-        plotName: plot.name,
-        mandal: plot.mandal,
-        district: plot.district,
-        mode: res.mode,
-        risks: res.risks,
-      });
-    } catch (err) {
-      console.error(`Failed risk eval for plot ${plot._id}:`, err.message);
-      results.push({
-        plotId: plot._id,
-        plotName: plot.name,
-        mandal: plot.mandal,
-        district: plot.district,
-        mode,
-        error: err.message,
-      });
+  for (let i = 0; i < totalPlots; i += BATCH_SIZE) {
+    const batch = plots.slice(i, i + BATCH_SIZE);
+    console.log(`🔄 Processing batch ${i / BATCH_SIZE + 1}/${Math.ceil(totalPlots / BATCH_SIZE)} (${batch.length} plots)...`);
+
+    const batchPromises = batch.map(async (plot) => {
+      try {
+        const res = await evaluateRiskForPlot(plot._id, {
+          daysWindow,
+          mode,
+          autoIngestIfMissing,
+          pastWeight,
+          futureWeight,
+        });
+
+        return {
+          plotId: plot._id,
+          plotName: plot.name,
+          mandal: plot.mandal,
+          district: plot.district,
+          mode: res.mode,
+          risks: res.risks,
+        };
+      } catch (err) {
+        console.error(`❌ Failed risk eval for plot ${plot._id}:`, err.message);
+        return {
+          plotId: plot._id,
+          plotName: plot.name,
+          mandal: plot.mandal,
+          district: plot.district,
+          mode,
+          error: err.message,
+        };
+      }
+    });
+
+    const batchResults = await Promise.all(batchPromises);
+    results.push(...batchResults);
+
+    // Rate Limiting: Sleep 1s between batches to respect Open-Meteo free tier (if ingesting)
+    if (i + BATCH_SIZE < totalPlots) {
+      // console.log("⏳ Waiting 1s before next batch...");
+      await new Promise((resolve) => setTimeout(resolve, 1000));
     }
   }
 
+  console.log("✅ All batches completed.");
   return results;
 }
 
